@@ -30,6 +30,18 @@ cmake -S . -B build -G Ninja \
 cmake --build build
 ```
 
+..or with loop unroll + fastmath:
+
+```bash
+cmake -S . -B build -G Ninja \
+  -DGPTATOMIC_TURBO_FASTMATH=ON \
+  -DGPTATOMIC_TURBO_UNROLL=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_COMPILER="$(brew --prefix llvm)/bin/clang++"
+
+cmake --build build
+```
+
 ### Ubuntu
 
 ```bash
