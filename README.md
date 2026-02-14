@@ -87,3 +87,84 @@ Example:
 ## License
 
 MIT, see `LICENSE`.
+
+## Example output from ./GptAtomicTurbo
+```bash
+--- inference (new, hallucinated names) ---
+sample  1: vilya
+sample  2: damiien
+sample  3: sana
+sample  4: maran
+sample  5: sonelo
+sample  6: nahela
+sample  7: mayania
+sample  8: atelin
+sample  9: karina
+sample 10: rielan
+sample 11: jene
+sample 12: donis
+sample 13: harana
+sample 14: anele
+sample 15: lannie
+sample 16: raey
+sample 17: adyney
+sample 18: jama
+sample 19: jarien
+sample 20: zaria
+
+generated chars (total)                    109
+
+--- run statistics ---
+mode                              turbo-kernels
+dataset path                      input.txt
+steps                             1000
+tokens per step (last)            7
+init (includes allocations)               3.03 ms
+training                                 25.25 ms
+inference                                 0.21 ms
+total (init+train+infer)                 28.49 ms
+train+infer (no init)                    25.47 ms
+training per step                        25.25 us
+inference per sample                     10.65 us
+loss                              first=3.6024 last=2.8826 min=1.5387 avg=2.4558
+```
+
+
+## Example output from ./GptAtomic --karpathy-py-compat
+```bash
+--- inference (new, hallucinated names) ---
+sample  1: kamon
+sample  2: ann
+sample  3: karai
+sample  4: jaire
+sample  5: vialan
+sample  6: karia
+sample  7: yeran
+sample  8: anna
+sample  9: areli
+sample 10: kaina
+sample 11: konna
+sample 12: keylen
+sample 13: liole
+sample 14: alerin
+sample 15: earan
+sample 16: lenne
+sample 17: kana
+sample 18: lara
+sample 19: alela
+sample 20: anton
+
+--- run statistics ---
+mode                              python-compat
+dataset path                      input.txt
+init (includes allocations)               3.92 ms
+training                                598.94 ms
+inference                                 2.09 ms
+total (init+train+infer)                604.95 ms
+train+infer (no init)                   601.03 ms
+training per step                       598.94 us
+inference per sample                    104.33 us
+loss                              first=3.3660 last=2.6497 min=1.5782 avg=2.4517
+arena peak used (nodes)                 116721 / 134931
+generated chars (total)                     98
+```
