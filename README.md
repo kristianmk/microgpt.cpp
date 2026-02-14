@@ -1,6 +1,6 @@
 # microgpt.cpp
 
-Small, single-file(s) C++23 implementations of a tiny character-level GPT model based on Andrej Karpathy’s microgpt [https://karpathy.github.io/2026/02/12/microgpt/]. Mostly written by ChatGPT 5.2 thinking and Claude Opus 4.6 Extended.
+Small, single-file(s) C++23 implementations of a tiny character-level GPT model based on Andrej Karpathy’s microgpt [https://karpathy.github.io/2026/02/12/microgpt/]. Mostly written by ChatGPT 5.2 thinking and Claude Opus 4.6 Extended. Not completely true to the 200-lines of Python code “art project”, but much faster and can optionally produce bitwise-identical output to the original.
 
 Two executables are built:
 
