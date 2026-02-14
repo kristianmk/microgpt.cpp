@@ -2,7 +2,6 @@
 //
 // C++23, std-only. Max-performance CPU kernels (no autograd graph).
 //
-//
 // Build in Release for real speed.
 
 #include <algorithm>
@@ -263,6 +262,9 @@ struct Model {
     std::vector<float> m{};
     std::vector<float> v{};
 
+    float beta1Pow{1.0F};
+    float beta2Pow{1.0F};
+
     Expected<void> init(int vocabSizeIn, int bosIdIn) noexcept {
         vocabSize = vocabSizeIn;
         bosId = bosIdIn;
@@ -308,6 +310,9 @@ struct Model {
         m.assign(toSize(static_cast<int>(off.totalParams)), 0.0F);
         v.assign(toSize(static_cast<int>(off.totalParams)), 0.0F);
 
+        beta1Pow = 1.0F;
+        beta2Pow = 1.0F;
+
         return {};
     }
 
@@ -325,8 +330,11 @@ struct Model {
     void adamStep(int step, int numSteps) noexcept {
         const float lrT{learningRate * (1.0F - float(step) / float(numSteps))};
 
-        const float b1t{std::pow(beta1, float(step + 1))};
-        const float b2t{std::pow(beta2, float(step + 1))};
+        beta1Pow *= beta1;
+        beta2Pow *= beta2;
+
+        const float invBias1{1.0F / (1.0F - beta1Pow)};
+        const float invBias2{1.0F / (1.0F - beta2Pow)};
 
         for (size_t i{0}; i < params.size(); ++i) {
             const float g{grads[i]};
@@ -334,8 +342,8 @@ struct Model {
             m[i] = beta1 * m[i] + (1.0F - beta1) * g;
             v[i] = beta2 * v[i] + (1.0F - beta2) * (g * g);
 
-            const float mHat{m[i] / (1.0F - b1t)};
-            const float vHat{v[i] / (1.0F - b2t)};
+            const float mHat{m[i] * invBias1};
+            const float vHat{v[i] * invBias2};
 
             params[i] -= lrT * mHat / (std::sqrt(vHat) + epsAdam);
         }
@@ -434,27 +442,60 @@ inline void rmsnormBackward(const float* dy, const float* x, float inv, float* d
     }
 }
 
-// Stable softmax into probs (len = L). Returns -log(prob[target]) for CE.
-inline float softmaxCrossEntropyForward(const float* logits, float* probs, int L, int target) noexcept {
+// Fused LM-head: forward logits + stable softmax CE + backward into dWLm and dXOut.
+// logitsTmp is used as scratch and will hold exp(logits - max) during the backward part.
+inline float lmHeadForwardBackward(const float* wLm,
+                                   float* dWLm,
+                                   const float* xOut,
+                                   float* dXOut,
+                                   float* logitsTmp,
+                                   int vocabSize,
+                                   int targetId,
+                                   float scale) noexcept {
     float maxVal{-std::numeric_limits<float>::infinity()};
-    for (int i{0}; i < L; ++i) {
-        maxVal = std::max(maxVal, logits[i]);
+    for (int o{0}; o < vocabSize; ++o) {
+        const float* row{wLm + o * nEmbd};
+        float z{0.0F};
+        for (int i{0}; i < nEmbd; ++i) {
+            z += row[i] * xOut[i];
+        }
+        logitsTmp[toSize(o)] = z;
+        maxVal = std::max(maxVal, z);
     }
 
     float sumExp{0.0F};
-    for (int i{0}; i < L; ++i) {
-        const float e{std::exp(logits[i] - maxVal)};
-        probs[i] = e;
+    for (int o{0}; o < vocabSize; ++o) {
+        const float e{std::exp(logitsTmp[toSize(o)] - maxVal)};
+        logitsTmp[toSize(o)] = e;
         sumExp += e;
     }
-
     const float invSum{1.0F / sumExp};
-    for (int i{0}; i < L; ++i) {
-        probs[i] *= invSum;
+
+    const float pT{std::max(logitsTmp[toSize(targetId)] * invSum, 1e-12F)};
+    const float loss{-std::log(pT)};
+
+    for (int i{0}; i < nEmbd; ++i) {
+        dXOut[i] = 0.0F;
     }
 
-    const float p{std::max(probs[target], 1e-12F)};
-    return -std::log(p);
+    for (int o{0}; o < vocabSize; ++o) {
+        const float prob{logitsTmp[toSize(o)] * invSum};
+        float dlog{prob};
+        if (o == targetId) {
+            dlog -= 1.0F;
+        }
+        dlog *= scale;
+
+        const float* row{wLm + o * nEmbd};
+        float* dRow{dWLm + o * nEmbd};
+
+        for (int i{0}; i < nEmbd; ++i) {
+            dRow[i] += dlog * xOut[i];
+            dXOut[i] += row[i] * dlog;
+        }
+    }
+
+    return loss;
 }
 
 // ----------------------------- training scratch -----------------------------
@@ -488,10 +529,7 @@ struct TrainScratch {
     std::array<std::array<float, nEmbd>, blockSize> fc2{};
     std::array<std::array<float, nEmbd>, blockSize> xOut{};
 
-    // probs per position: [T][vocab]
-    std::vector<float> probs{};
-
-    // Temporary buffers (reused)
+    // Temporary buffer (reused)
     std::vector<float> logitsTmp{};
 
     // Backward buffers
@@ -512,7 +550,6 @@ struct TrainScratch {
 
     Expected<void> init(int vocabSize) noexcept {
         attnW.assign(toSize(blockSize * blockSize * nHead), 0.0F);
-        probs.assign(toSize(blockSize * vocabSize), 0.0F);
         logitsTmp.assign(toSize(vocabSize), 0.0F);
         return {};
     }
@@ -524,21 +561,12 @@ struct TrainScratch {
     inline const float& attnWeight(int t, int s, int h) const noexcept {
         return attnW[toSize(((t * blockSize + s) * nHead) + h)];
     }
-
-    inline float* probsRow(int t, int vocabSize) noexcept {
-        return probs.data() + toSize(t * vocabSize);
-    }
-
-    inline const float* probsRow(int t, int vocabSize) const noexcept {
-        return probs.data() + toSize(t * vocabSize);
-    }
 };
 
 // ----------------------------- attention forward/backward -----------------------------
 inline void attentionForward(const TrainScratch& scIn,
                              TrainScratch& sc,
                              int T) noexcept {
-    // Uses q,k,v from sc.q/sc.k/sc.v, writes attnConcat.
     const float invSqrtHd{1.0F / std::sqrt(float(headDim))};
 
     for (int t{0}; t < T; ++t) {
@@ -549,9 +577,9 @@ inline void attentionForward(const TrainScratch& scIn,
         for (int h{0}; h < nHead; ++h) {
             const int hs{h * headDim};
 
-            // scores s=0..t
             float maxScore{-std::numeric_limits<float>::infinity()};
-            std::array<float, blockSize> score{};
+            std::array<float, blockSize> score; // only [0..t] used
+
             for (int s{0}; s <= t; ++s) {
                 const float d{dot(&scIn.q[toSize(t)][toSize(hs)], &scIn.k[toSize(s)][toSize(hs)], headDim) * invSqrtHd};
                 score[toSize(s)] = d;
@@ -570,7 +598,6 @@ inline void attentionForward(const TrainScratch& scIn,
                 sc.attnWeight(t, s, h) *= invSum;
             }
 
-            // head output
             for (int j{0}; j < headDim; ++j) {
                 float acc{0.0F};
                 for (int s{0}; s <= t; ++s) {
@@ -595,16 +622,10 @@ inline void attentionBackward(const TrainScratch& sc,
         }
     }
 
-    // Per head
     for (int h{0}; h < nHead; ++h) {
         const int hs{h * headDim};
 
-        std::array<std::array<float, blockSize>, blockSize> dScore{};
-        for (int t{0}; t < T; ++t) {
-            for (int s{0}; s < T; ++s) {
-                dScore[toSize(t)][toSize(s)] = 0.0F;
-            }
-        }
+        std::array<std::array<float, blockSize>, blockSize> dScore{}; // already zeroed
 
         // 1) dV and dW from headOut = sum_s w_ts * v_s
         for (int t{0}; t < T; ++t) {
@@ -695,11 +716,9 @@ float trainStep(Model& model,
     const int T{std::min(blockSize, len - 1)};
     outTokenCount = T;
 
-    // Clear grads
-    model.zeroGrads();
+    // NOTE: grads are cleared by model.adamStep() once per step.
 
     // ---------------- forward ----------------
-    // xEmbSum, x0
     for (int t{0}; t < T; ++t) {
         const int tokenId{tokens[toSize(t)]};
 
@@ -715,21 +734,18 @@ float trainStep(Model& model,
         s.inv0[toSize(t)] = rmsnormForward(s.xEmbSum[toSize(t)].data(), s.x0[toSize(t)].data(), nEmbd);
     }
 
-    // Layer 0: norm1 -> qkv
     for (int t{0}; t < T; ++t) {
         s.inv1[toSize(t)] = rmsnormForward(s.x0[toSize(t)].data(), s.x1[toSize(t)].data(), nEmbd);
 
-        const float* x{ s.x1[toSize(t)].data() };
+        const float* x{s.x1[toSize(t)].data()};
 
         linearForward(&model.params[toSize(static_cast<int>(model.off.attnWq[0]))], x, s.q[toSize(t)].data(), nEmbd, nEmbd);
         linearForward(&model.params[toSize(static_cast<int>(model.off.attnWk[0]))], x, s.k[toSize(t)].data(), nEmbd, nEmbd);
         linearForward(&model.params[toSize(static_cast<int>(model.off.attnWv[0]))], x, s.v[toSize(t)].data(), nEmbd, nEmbd);
     }
 
-    // Attention
     attentionForward(s, s, T);
 
-    // attnProj = Wo * attnConcat, x2 = x0 + attnProj
     for (int t{0}; t < T; ++t) {
         linearForward(&model.params[toSize(static_cast<int>(model.off.attnWo[0]))],
                       s.attnConcat[toSize(t)].data(),
@@ -740,20 +756,17 @@ float trainStep(Model& model,
         addVec(s.x0[toSize(t)].data(), s.attnProj[toSize(t)].data(), s.x2[toSize(t)].data(), nEmbd);
     }
 
-    // norm2 -> mlp -> xOut
     for (int t{0}; t < T; ++t) {
         s.inv2[toSize(t)] = rmsnormForward(s.x2[toSize(t)].data(), s.x3[toSize(t)].data(), nEmbd);
 
-        // fc1
         linearForward(&model.params[toSize(static_cast<int>(model.off.mlpFc1[0]))],
                       s.x3[toSize(t)].data(),
                       s.fc1Pre[toSize(t)].data(),
                       4 * nEmbd,
                       nEmbd);
 
-        // relu
         for (int i{0}; i < 4 * nEmbd; ++i) {
-            const float v{ s.fc1Pre[toSize(t)][toSize(i)] };
+            const float v{s.fc1Pre[toSize(t)][toSize(i)]};
             if (v > 0.0F) {
                 s.fc1Relu[toSize(t)][toSize(i)] = v;
                 s.reluMask[toSize(t)][toSize(i)] = uint8_t{1};
@@ -763,7 +776,6 @@ float trainStep(Model& model,
             }
         }
 
-        // fc2
         linearForward(&model.params[toSize(static_cast<int>(model.off.mlpFc2[0]))],
                       s.fc1Relu[toSize(t)].data(),
                       s.fc2[toSize(t)].data(),
@@ -773,28 +785,7 @@ float trainStep(Model& model,
         addVec(s.x2[toSize(t)].data(), s.fc2[toSize(t)].data(), s.xOut[toSize(t)].data(), nEmbd);
     }
 
-    // output: logits -> probs -> loss
-    float loss{0.0F};
-
-    for (int t{0}; t < T; ++t) {
-        const float* x{ s.xOut[toSize(t)].data() };
-        const float* wLm{ &model.params[toSize(static_cast<int>(model.off.lmHead))] };
-
-        for (int o{0}; o < model.vocabSize; ++o) {
-            const float* row{wLm + o * nEmbd};
-            s.logitsTmp[toSize(o)] = dot(row, x, nEmbd);
-        }
-
-        const int targetId{tokens[toSize(t + 1)]};
-        float* probs{ s.probsRow(t, model.vocabSize) };
-        loss += softmaxCrossEntropyForward(s.logitsTmp.data(), probs, model.vocabSize, targetId);
-    }
-
-    const float invT{1.0F / float(T)};
-    const float lossMean{loss * invT};
-
     // ---------------- backward ----------------
-    // clear backward buffers
     for (int t{0}; t < T; ++t) {
         setZero(s.dXOut[toSize(t)].data(), nEmbd);
         setZero(s.dX2[toSize(t)].data(), nEmbd);
@@ -808,43 +799,29 @@ float trainStep(Model& model,
         setZero(s.dFc1Pre[toSize(t)].data(), 4 * nEmbd);
     }
 
-    // 1) output layer backward, accumulate dXOut
-    const float* wLm{ &model.params[toSize(static_cast<int>(model.off.lmHead))] };
-    float* dWLm{ &model.grads[toSize(static_cast<int>(model.off.lmHead))] };
+    // 1) fused output layer: loss + dWLm + dXOut
+    float loss{0.0F};
+    const float* wLm{&model.params[toSize(static_cast<int>(model.off.lmHead))]};
+    float* dWLm{&model.grads[toSize(static_cast<int>(model.off.lmHead))]};
+    const float scale{1.0F / float(T)};
 
     for (int t{0}; t < T; ++t) {
         const int targetId{tokens[toSize(t + 1)]};
-        const float scale{invT};
-
-        const float* probs{ s.probsRow(t, model.vocabSize) };
-        const float* xOut{ s.xOut[toSize(t)].data() };
-        float* dXOut{ s.dXOut[toSize(t)].data() };
-
-        for (int i{0}; i < nEmbd; ++i) {
-            dXOut[i] = 0.0F;
-        }
-
-        for (int o{0}; o < model.vocabSize; ++o) {
-            float dlog{probs[toSize(o)]};
-            if (o == targetId) {
-                dlog -= 1.0F;
-            }
-            dlog *= scale;
-
-            const float* row{wLm + o * nEmbd};
-            float* dRow{dWLm + o * nEmbd};
-
-            for (int i{0}; i < nEmbd; ++i) {
-                dRow[i] += dlog * xOut[i];
-                dXOut[i] += row[i] * dlog;
-            }
-        }
+        loss += lmHeadForwardBackward(wLm,
+                                      dWLm,
+                                      s.xOut[toSize(t)].data(),
+                                      s.dXOut[toSize(t)].data(),
+                                      s.logitsTmp.data(),
+                                      model.vocabSize,
+                                      targetId,
+                                      scale);
     }
+
+    const float lossMean{loss * (1.0F / float(T))};
 
     // 2) back through xOut = x2 + fc2
     for (int t{0}; t < T; ++t) {
         addInPlace(s.dX2[toSize(t)].data(), s.dXOut[toSize(t)].data(), nEmbd);
-
         for (int i{0}; i < nEmbd; ++i) {
             s.dFc2[toSize(t)][toSize(i)] = s.dXOut[toSize(t)][toSize(i)];
         }
@@ -852,15 +829,11 @@ float trainStep(Model& model,
 
     // 3) fc2 backward: fc2 = W2 * relu
     {
-        const float* w2{ &model.params[toSize(static_cast<int>(model.off.mlpFc2[0]))] };
-        float* dW2{ &model.grads[toSize(static_cast<int>(model.off.mlpFc2[0]))] };
+        const float* w2{&model.params[toSize(static_cast<int>(model.off.mlpFc2[0]))]};
+        float* dW2{&model.grads[toSize(static_cast<int>(model.off.mlpFc2[0]))]};
 
         for (int t{0}; t < T; ++t) {
             float dRelu[4 * nEmbd]{};
-            for (int i{0}; i < 4 * nEmbd; ++i) {
-                dRelu[i] = 0.0F;
-            }
-
             for (int o{0}; o < nEmbd; ++o) {
                 const float dyo{s.dFc2[toSize(t)][toSize(o)]};
                 const float* row{w2 + o * (4 * nEmbd)};
@@ -880,11 +853,11 @@ float trainStep(Model& model,
 
     // 4) fc1 backward: fc1Pre = W1 * x3, accumulate dX3
     {
-        const float* w1{ &model.params[toSize(static_cast<int>(model.off.mlpFc1[0]))] };
-        float* dW1{ &model.grads[toSize(static_cast<int>(model.off.mlpFc1[0]))] };
+        const float* w1{&model.params[toSize(static_cast<int>(model.off.mlpFc1[0]))]};
+        float* dW1{&model.grads[toSize(static_cast<int>(model.off.mlpFc1[0]))]};
 
         for (int t{0}; t < T; ++t) {
-            float* dX3{ s.dX3[toSize(t)].data() };
+            float* dX3{s.dX3[toSize(t)].data()};
             for (int i{0}; i < nEmbd; ++i) {
                 dX3[i] = 0.0F;
             }
@@ -916,11 +889,11 @@ float trainStep(Model& model,
 
     // 7) Wo backward
     {
-        const float* wO{ &model.params[toSize(static_cast<int>(model.off.attnWo[0]))] };
-        float* dWO{ &model.grads[toSize(static_cast<int>(model.off.attnWo[0]))] };
+        const float* wO{&model.params[toSize(static_cast<int>(model.off.attnWo[0]))]};
+        float* dWO{&model.grads[toSize(static_cast<int>(model.off.attnWo[0]))]};
 
         for (int t{0}; t < T; ++t) {
-            float* dAttnConcat{ s.dAttnConcat[toSize(t)].data() };
+            float* dAttnConcat{s.dAttnConcat[toSize(t)].data()};
             for (int i{0}; i < nEmbd; ++i) {
                 dAttnConcat[i] = 0.0F;
             }
@@ -944,14 +917,14 @@ float trainStep(Model& model,
     }
 
     {
-        const float* wQ{ &model.params[toSize(static_cast<int>(model.off.attnWq[0]))] };
-        float* dWQ{ &model.grads[toSize(static_cast<int>(model.off.attnWq[0]))] };
+        const float* wQ{&model.params[toSize(static_cast<int>(model.off.attnWq[0]))]};
+        float* dWQ{&model.grads[toSize(static_cast<int>(model.off.attnWq[0]))]};
 
-        const float* wK{ &model.params[toSize(static_cast<int>(model.off.attnWk[0]))] };
-        float* dWK{ &model.grads[toSize(static_cast<int>(model.off.attnWk[0]))] };
+        const float* wK{&model.params[toSize(static_cast<int>(model.off.attnWk[0]))]};
+        float* dWK{&model.grads[toSize(static_cast<int>(model.off.attnWk[0]))]};
 
-        const float* wV{ &model.params[toSize(static_cast<int>(model.off.attnWv[0]))] };
-        float* dWV{ &model.grads[toSize(static_cast<int>(model.off.attnWv[0]))] };
+        const float* wV{&model.params[toSize(static_cast<int>(model.off.attnWv[0]))]};
+        float* dWV{&model.grads[toSize(static_cast<int>(model.off.attnWv[0]))]};
 
         for (int t{0}; t < T; ++t) {
             linearBackwardAcc(wQ, s.x1[toSize(t)].data(), s.dQ[toSize(t)].data(), dWQ, s.dX1[toSize(t)].data(), nEmbd, nEmbd);
@@ -972,9 +945,6 @@ float trainStep(Model& model,
     // 11) rmsnorm0 backward -> scatter to embeddings
     for (int t{0}; t < T; ++t) {
         float dXEmbSum[nEmbd]{};
-        for (int i{0}; i < nEmbd; ++i) {
-            dXEmbSum[i] = 0.0F;
-        }
 
         rmsnormBackward(s.dX0[toSize(t)].data(),
                         s.xEmbSum[toSize(t)].data(),
@@ -994,7 +964,6 @@ float trainStep(Model& model,
         }
     }
 
-    // FIX: Do NOT call adamStep here. The caller handles it with the correct schedule.
     return lossMean;
 }
 
@@ -1077,7 +1046,6 @@ void runInference(const Model& model,
         int outLen{0};
 
         for (int posId{0}; posId < blockSize; ++posId) {
-            // embedding + norm0
             const uint32_t wteRow{model.off.wte + toU32(tokenId * nEmbd)};
             const uint32_t wpeRow{model.off.wpe + toU32(posId * nEmbd)};
             for (int i{0}; i < nEmbd; ++i) {
@@ -1087,7 +1055,6 @@ void runInference(const Model& model,
             }
             (void)rmsnormForward(s.xEmbSum.data(), s.x0.data(), nEmbd);
 
-            // norm1 -> qkv
             (void)rmsnormForward(s.x0.data(), s.x1.data(), nEmbd);
 
             linearForward(&model.params[toSize(static_cast<int>(model.off.attnWq[0]))], s.x1.data(), s.q.data(), nEmbd, nEmbd);
@@ -1101,7 +1068,6 @@ void runInference(const Model& model,
             }
             cacheLen[0] = t + 1;
 
-            // attention output
             for (int i{0}; i < nEmbd; ++i) {
                 s.attnConcat[toSize(i)] = 0.0F;
             }
@@ -1110,7 +1076,8 @@ void runInference(const Model& model,
                 const int hs{h * headDim};
 
                 float maxScore{-std::numeric_limits<float>::infinity()};
-                std::array<float, blockSize> score{};
+                std::array<float, blockSize> score;
+
                 for (int ss{0}; ss < cacheLen[0]; ++ss) {
                     float d{0.0F};
                     for (int j{0}; j < headDim; ++j) {
@@ -1121,7 +1088,7 @@ void runInference(const Model& model,
                     maxScore = std::max(maxScore, d);
                 }
 
-                std::array<float, blockSize> w{};
+                std::array<float, blockSize> w;
                 float sumExp{0.0F};
                 for (int ss{0}; ss < cacheLen[0]; ++ss) {
                     const float e{std::exp(score[toSize(ss)] - maxScore)};
@@ -1142,11 +1109,9 @@ void runInference(const Model& model,
                 }
             }
 
-            // proj + residual
             linearForward(&model.params[toSize(static_cast<int>(model.off.attnWo[0]))], s.attnConcat.data(), s.attnProj.data(), nEmbd, nEmbd);
             addVec(s.x0.data(), s.attnProj.data(), s.x2.data(), nEmbd);
 
-            // norm2 + mlp + residual
             (void)rmsnormForward(s.x2.data(), s.x3.data(), nEmbd);
 
             linearForward(&model.params[toSize(static_cast<int>(model.off.mlpFc1[0]))], s.x3.data(), s.fc1.data(), 4 * nEmbd, nEmbd);
@@ -1157,14 +1122,12 @@ void runInference(const Model& model,
             linearForward(&model.params[toSize(static_cast<int>(model.off.mlpFc2[0]))], s.fc1.data(), s.fc2.data(), nEmbd, 4 * nEmbd);
             addVec(s.x2.data(), s.fc2.data(), s.xOut.data(), nEmbd);
 
-            // logits
-            const float* wLm{ &model.params[toSize(static_cast<int>(model.off.lmHead))] };
+            const float* wLm{&model.params[toSize(static_cast<int>(model.off.lmHead))]};
             for (int o{0}; o < model.vocabSize; ++o) {
                 const float* row{wLm + o * nEmbd};
                 s.logits[toSize(o)] = dot(row, s.xOut.data(), nEmbd);
             }
 
-            // sample
             float maxVal{-std::numeric_limits<float>::infinity()};
             for (int i{0}; i < model.vocabSize; ++i) {
                 maxVal = std::max(maxVal, s.logits[toSize(i)] / temperature);
@@ -1182,8 +1145,6 @@ void runInference(const Model& model,
                 s.probs[toSize(i)] *= invSum;
             }
 
-            // FIX: Suppress BOS at position 0 to prevent blank samples.
-            // The first generated character must be a real character, not EOS.
             if (posId == 0) {
                 s.probs[toSize(tok.bosId)] = 0.0F;
                 float reSum{0.0F};
@@ -1265,7 +1226,6 @@ int main(int argc, char** argv) {
 
         std::mt19937 rng{42u};
 
-        // init
         const auto tInitStart{Clock::now()};
 
         auto docsExp{readDocs(args.datasetPath)};
@@ -1306,7 +1266,6 @@ int main(int argc, char** argv) {
 
         const auto tInitEnd{Clock::now()};
 
-        // training
         const auto tTrainStart{Clock::now()};
 
         float lossFirst{0.0F};
@@ -1316,8 +1275,6 @@ int main(int argc, char** argv) {
         int lastTokenCount{0};
 
         for (int step{0}; step < args.steps; ++step) {
-            // FIX: trainStep computes forward/backward and accumulates grads.
-            // Adam update happens once here with the correct schedule.
             const float loss{trainStep(model, scratch, tok, docs, step, rng, lastTokenCount)};
             model.adamStep(step, args.steps);
 
@@ -1337,14 +1294,12 @@ int main(int argc, char** argv) {
 
         const auto tTrainEnd{Clock::now()};
 
-        // inference
         const auto tInferStart{Clock::now()};
         runInference(model, tok, args.samples, args.temperature, rng);
         const auto tInferEnd{Clock::now()};
 
         const auto tProgramEnd{Clock::now()};
 
-        // summary
         const auto initDur{tInitEnd - tInitStart};
         const auto trainDur{tTrainEnd - tTrainStart};
         const auto inferDur{tInferEnd - tInferStart};
