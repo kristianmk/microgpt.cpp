@@ -131,14 +131,14 @@ mode                              turbo-kernels
 dataset path                      input.txt
 steps                             1000
 tokens per step (last)            7
-init (includes allocations)               2.81 ms
-training                                 21.93 ms
-inference                                 0.19 ms
-total (init+train+infer)                 24.93 ms
-train+infer (no init)                    22.12 ms
-training per step                        21.93 us
-inference per sample                      9.52 us
-loss                              first=3.6024 last=2.8826 min=1.5387 avg=2.4558
+init (includes allocations)               2.97 ms
+training                                 16.90 ms
+inference                                 0.11 ms
+total (init+train+infer)                 19.99 ms
+train+infer (no init)                    17.02 ms
+training per step                        16.90 us
+inference per sample                      5.70 us
+loss                              first=3.6024 last=2.8815 min=0.0000 avg=2.4559
 ```
 
 
