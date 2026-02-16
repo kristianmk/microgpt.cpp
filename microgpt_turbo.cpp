@@ -18,7 +18,6 @@
 #include <random>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <vector>
 
 namespace {
@@ -393,7 +392,7 @@ inline float lmHeadForwardBackward(const float* __restrict__ wLm,
                                    int vocabSize,
                                    int targetId,
                                    float scale_) noexcept {
-    float maxVal = -std::numeric_limits<float>::infinity();
+    float maxVal = std::numeric_limits<float>::lowest();
     for (int o = 0; o < vocabSize; ++o) {
         float z = dot<nEmbd>(wLm + o * nEmbd, xOut);
         logitsTmp[toSize(o)] = z;
@@ -489,7 +488,7 @@ inline void attentionForward(const TrainScratch& scIn,
         for (int h = 0; h < nHead; ++h) {
             const int hs = h * headDim;
             float* __restrict__ aw = sc.awRow(t, h);
-            float maxScore = -std::numeric_limits<float>::infinity();
+            float maxScore = std::numeric_limits<float>::lowest();
             for (int s = 0; s <= t; ++s) {
                 float d = dot<headDim>(&scIn.q[toSize(t)][toSize(hs)],
                                        &scIn.k[toSize(s)][toSize(hs)]) * invSqrtHeadDim;
@@ -867,7 +866,7 @@ void runInference(const Model& model, const Tokenizer& tok,
             setZero<nEmbd>(s.attnConcat.data());
             for (int h = 0; h < nHead; ++h) {
                 const int hs = h * headDim;
-                float maxScore = -std::numeric_limits<float>::infinity();
+                float maxScore = std::numeric_limits<float>::lowest();
                 alignas(64) std::array<float, blockSize> score;
                 for (int ss = 0; ss < cacheLen[0]; ++ss) {
                     float d = dot<headDim>(
@@ -916,7 +915,7 @@ void runInference(const Model& model, const Tokenizer& tok,
                 s.logits[toSize(o)] =
                     dot<nEmbd>(wLm + o * nEmbd, s.xOut.data());
 
-            float maxVal = -std::numeric_limits<float>::infinity();
+            float maxVal = std::numeric_limits<float>::lowest();
             for (int i = 0; i < model.vocabSize; ++i)
                 maxVal = std::max(maxVal,
                                   s.logits[toSize(i)] / temperature);
@@ -1040,7 +1039,7 @@ int main(int argc, char** argv) {
         const auto tInitEnd = Clock::now();
         const auto tTrainStart = Clock::now();
         float lossFirst = 0.0F, lossLast = 0.0F;
-        float lossMin = std::numeric_limits<float>::infinity();
+        float lossMin = std::numeric_limits<float>::max();
         float lossSum = 0.0F;
         int lastTokenCount = 0;
 
